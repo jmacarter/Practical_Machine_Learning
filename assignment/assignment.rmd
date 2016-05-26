@@ -1,6 +1,6 @@
 ---
 title: 'Coursera: Practical Machine Learning Assignment: Prediction Assignment Writeup'
-author: "Jeff Carter [GitHub](https://github.com/jmacarter)"
+author: "Jeff Carter [GitHub](https://github.com/jmacarter/Practical_Machine_Learning)"
 output:
   html_document:
     keep_md: yes
@@ -12,46 +12,176 @@ message(sprintf("Run time: %s\nR version: %s", Sys.time(), R.Version()$version.s
 ```
 
 
-This document stepwise describes the analysis performed for the prediction assignment of the Coursera's Practical Machine Learning course. This project uses data from the accelerometers of fitness devices of six participants to determine the manner in which they performed a particular exercise. 
+This document establishes a stepwise description of the analysis performed for the prediction assignment of the Coursera's Practical Machine Learning course. This project uses data from the accelerometers of fitness devices of six participants to determine the manner in which they performed a particular exercise. 
 
 
 Libraries used in the analysis will be loaded first. A seed value is also set at this time.
-
-```{r}
-options(warn=-1)
+```{r, echo=FALSE}
 library(caret)
-library(randomForest)
-
-library(Hmisc)
-library(foreach)
+library(parallel)
 library(doParallel)
+library(data.table)
 set.seed(2016)
 ```
 
-The first step is to download and preprocess the training and test data for this project. As noted in Reproducible Research lectures, the download date will also be recorded.
-
-analyze the type & the completion rate of the data. 
+# Prepare the datasets
+The first step is to download and preprocess the training and test data for this project. As noted in Reproducible Research lectures, the download date will also be recorded when the data is downloaded, for posterity.
 ```{r}
-# Make a data directory for data files for this assignment, if not present
-if (!file.exists("./data"))
-{
-     dir.create("./data")
-}
+require(data.table)
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+D <- fread(url)
 
-# Download the training and test data files, if necessary, and record the download date
-if (!file.exists("./data/data.zip"))
-{
-     URL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
-     download.file(URL,"./data/pml-training.csv", mode = "wb")
-   
-     URL <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
-     download.file(URL,"./data/pml-testing.csv", mode = "wb")
-   
-     # record the download date, as mentioned in lectures
-     DownloadDate <- date()
-     sink("./data/download_date.txt")
-     cat("Date data downloaded: ")
-     cat(DownloadDate)
-     sink()
+# record the download date, as mentioned in lectures
+DownloadDate <- date()
+sink("./data/download_date_training.txt")
+cat("Date training data downloaded: ")
+cat(DownloadDate)
+sink()
+
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+DTest <- fread(url)
+
+# record the download date, as mentioned in lectures
+DownloadDate <- date()
+sink("./data/download_date_testing.txt")
+cat("Date testing data downloaded: ")
+cat(DownloadDate)
+sink()
+```
+
+## Identify predictor candidates in the testing dataset
+We need to identify variables in the test dataset without missing or NA values; these will be suitable **predictor candidates**.
+```{r}
+isAnyMissing <- sapply(DTest, function (x) any(is.na(x) | x == ""))
+isPredictor <- !isAnyMissing & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isAnyMissing))
+predCandidates <- names(isAnyMissing)[isPredictor]
+predCandidates
+```
+Belt, arm, dumbbell, and forearm variables lack missing values in the test dataset and will be used as predictors.
+
+## Subset the training dataset
+We next subset the primary dataset to include only the predictor candidates identified above, and the outcome variable, `classe` and cast `classe` as a factor.
+```{r}
+varToInclude <- c("classe", predCandidates)
+D <- D[, varToInclude, with=FALSE]
+dim(D)
+names(D)
+D <- D[, classe := factor(D[, classe])]
+D[, .N, classe]
+```
+
+
+We then split the primary dataset into a 60% training and 40% probing dataset.
+```{r}
+require(caret)
+inTrain <- createDataPartition(D$classe, p=0.6)
+DTrain <- D[inTrain[[1]]]
+DProbe <- D[-inTrain[[1]]]
+```
+
+Next, we center and scale the prediction variables, and apply the centering and scaling to the probing dataset.
+```{r}
+X <- DTrain[, predCandidates, with=FALSE]
+preProc <- preProcess(X)
+preProc
+XCS <- predict(preProc, X)
+DTrainCS <- data.table(data.frame(classe = DTrain[, classe], XCS))
+
+X <- DProbe[, predCandidates, with=FALSE]
+XCS <- predict(preProc, X)
+DProbeCS <- data.table(data.frame(classe = DProbe[, classe], XCS))
+```
+
+At this time, we also look at the variance, checking for near-zero variance.
+```{r}
+nzv <- nearZeroVar(DTrainCS, saveMetrics=TRUE)
+if (any(nzv$nzv)) nzv else message("No variables with near-zero variance")
+```
+
+We'll visualize the prediction variables, by group.
+```{r histGroup}
+histGroup <- function (data, regex) {
+  col <- grep(regex, names(data))
+  col <- c(col, which(names(data) == "classe"))
+  require(reshape2)
+  n <- nrow(data)
+  DMelted <- melt(data[, col, with=FALSE][, rownum := seq(1, n)], id.vars=c("rownum", "classe"))
+  require(ggplot2)
+  ggplot(DMelted, aes(x=classe, y=value)) +
+    geom_violin(aes(color=classe, fill=classe), alpha=1/2) +
+#     geom_jitter(aes(color=classe, fill=classe), alpha=1/10) +
+#     geom_smooth(aes(group=1), method="gam", color="black", alpha=1/2, size=2) +
+    facet_wrap(~ variable, scale="free_y") +
+    scale_color_brewer(palette="Spectral") +
+    scale_fill_brewer(palette="Spectral") +
+    labs(x="", y="") +
+    theme(legend.position="none")
 }
+histGroup(DTrainCS, "belt")
+histGroup(DTrainCS, "[^(fore)]arm")
+histGroup(DTrainCS, "dumbbell")
+histGroup(DTrainCS, "forearm")
+```
+
+# Train a prediction model
+Using random forest methodology, the out-of-sample error should be small. We'll estimate the error using the 40% probing sample.
+
+
+Set up the parallel clusters, and establish control parameters.
+```{r}
+require(parallel)
+require(doParallel)
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+ctrl <- trainControl(classProbs=TRUE,
+                     savePredictions=TRUE,
+                     allowParallel=TRUE)
+```
+
+Then fit out model over the training parameters.
+```{r}
+method <- "rf"
+system.time(trainingModel <- train(classe ~ ., data=DTrainCS, method=method))
+```
+
+Finally, we terminate the clustering.
+```{r}
+stopCluster(cl)
+```
+
+Now, we evaluate our model using the training and probing datasets, and present the final model.
+## Evaluate the model on the training dataset
+```{r}
+trainingModel
+hat <- predict(trainingModel, DTrainCS)
+confusionMatrix(hat, DTrain[, classe])
+```
+
+## Evaluate the model on the probing dataset
+```{r}
+hat <- predict(trainingModel, DProbeCS)
+confusionMatrix(hat, DProbeCS[, classe])
+```
+## Display the final model
+
+```{r finalModel}
+varImp(trainingModel)
+trainingModel$finalModel
+#save the training model for use with the testing data
+save(trainingModel, file="trainingModel.RData")
+```
+
+# Predict on the test data
+Now we can begin prediction on the testing dataset, using the model we just saved
+```{r}
+load(file="trainingModel.RData", verbose=TRUE)
+```
+
+We determine the predictions and evaluate.
+```{r}
+DTestCS <- predict(preProc, DTest[, predCandidates, with=FALSE])
+hat <- predict(trainingModel, DTestCS)
+DTest <- cbind(hat , DTest)
+subset(DTest, select=names(DTest)[grep("belt|[^(fore)]arm|dumbbell|forearm", names(DTest), invert=TRUE)])
 ```
